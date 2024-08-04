@@ -1,0 +1,44 @@
+#  Docker-push pipeline
+
+image: atlassian/default-image:3
+
+pipelines:
+  branches:
+    develop:
+      - step:
+          name: Build and Test
+          script:
+            - docker build . --file Dockerfile -t ordersgrid/${IMAGE_NAME}:latest
+            - docker login --username ${DOCKERHUB_USERNAME} --password ${DOCKERHUB_PASSWORD}
+            - docker push ordersgrid/${IMAGE_NAME}:latest
+          services:
+            - docker
+          caches:
+            - docker
+  custom:
+    prod-image:
+      - step:
+          name: Patch version
+          script:
+            - 'v=$(npm version -m "%s [skip ci]" patch)'
+            - 'git config user.email commits-noreply@bitbucket.org'
+            - 'git config push.default current'
+            - 'git push origin ${v}'
+            - 'git push'
+      - step:
+          name: Manual image create
+          runs-on:
+            - self.hosted
+          script:
+            - PROJ_VERSION=$(node -p "require('./package.json').version")
+            - PROD_IMAGE_NAME=$(node -p "require('./package.json').name")
+            - echo ${PROJ_VERSION}
+            - echo ${PROD_IMAGE_NAME}
+            - docker build . --file Dockerfile -t ordersgrid/${PROD_IMAGE_NAME}:${PROJ_VERSION}
+            - docker tag ordersgrid/${PROD_IMAGE_NAME}:${PROJ_VERSION} ordersgrid/${PROD_IMAGE_NAME}:latest
+            - docker login --username ${DOCKERHUB_USERNAME} --password ${DOCKERHUB_PASSWORD}
+            - docker push ordersgrid/${PROD_IMAGE_NAME}:${PROJ_VERSION}
+            - docker push ordersgrid/${PROD_IMAGE_NAME}:latest
+            - curl -X POST  ${JENKINS_URL}/job/BackendDeployment/buildWithParameters -H "Content-Type:application/x-www-form-urlencoded"  -H "Authorization:Basic ${JENKINS_AUTH_KEY}" --data-urlencode server=prod --data-urlencode project=dispatch-delivery
+          services:
+            - docker
