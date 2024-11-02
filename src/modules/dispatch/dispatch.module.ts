@@ -10,6 +10,7 @@ import { DispatchConfigsRepository } from '../../database/repositories';
 import { MongooseModule } from '@nestjs/mongoose';
 import { DispatchConfigs, DispatchConfigsSchema } from '../../database/schemas';
 import { DeliveryProvidersGatewayModule } from '../../common/services';
+import { DispatchEventsProcessorService } from './dispatch-events-porocessor.service';
 
 @Module({
   imports: [
@@ -27,6 +28,7 @@ import { DeliveryProvidersGatewayModule } from '../../common/services';
     DispatchService,
     DispatchMonitoringService,
     DispatchConfigsRepository,
+    DispatchEventsProcessorService,
   ],
 })
 export class DispatchModule {}

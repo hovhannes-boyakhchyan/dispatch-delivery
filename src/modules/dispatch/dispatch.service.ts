@@ -12,6 +12,7 @@ import { Task, Quote, Job } from '../../database/schemas';
 import { DeliveryProvidersEnum, TaskStatusEnums } from '../../common/enums';
 import { DRIVER_NOT_CONFIRM_DELIVERY } from '../../common/constants';
 import { DeliveryProvidersGatewayService } from '../../common/services';
+import { TaskStatusDto } from './dto';
 
 @Injectable()
 export class DispatchService {
@@ -31,12 +32,31 @@ export class DispatchService {
 
   async createJob(createJobDto: CreateJobDto): Promise<Job> {
     try {
+      if (createJobDto.quoteExternalReference) {
+        const job = await this.findJobByQuoteId(
+          createJobDto.quoteExternalReference,
+        );
+        if (job) return job;
+      }
       const quote: Quote = await this.getOrCreateNewQuote(createJobDto);
 
       return this.createJobByQuoteList(quote, createJobDto);
     } catch (e) {
       throw new BadRequestException(e);
     }
+  }
+
+  private async findJobByQuoteId(quoteId: string): Promise<Job | null> {
+    const task = await this.taskRepository.findOne(
+      {
+        internalQuoteId: quoteId,
+      },
+      false,
+      { _id: 1 },
+    );
+
+    if (!task) return;
+    return this.jobRepository.findOne({ taskList: task._id });
   }
 
   private async createJobByQuoteList(
@@ -49,9 +69,7 @@ export class DispatchService {
           return await this.jobService.create(createJobData, {
             _id: quote._id,
             quoteId: providerQuote.quoteId,
-            taskId: providerQuote.taskId,
-            jobId: providerQuote.jobId,
-            jobConfigurationId: providerQuote.jobConfigurationId,
+            jobId: createJobData.jobId,
             providerService: quoteList.providerService,
           });
         } catch (e) {
@@ -78,12 +96,14 @@ export class DispatchService {
         createTaskData,
       );
 
-      await this.jobRepository.updateOne(
-        { _id: jobId },
-        { $push: { taskList: task._id } },
-      );
+      if (task) {
+        await this.jobRepository.updateOne(
+          { _id: jobId },
+          { $push: { taskList: task._id } },
+        );
 
-      createdTaskList.push(task);
+        createdTaskList.push(task);
+      }
     }
 
     return createdTaskList;
@@ -123,6 +143,13 @@ export class DispatchService {
       _id: jobId,
     });
 
+    if (cancelJobDto.editorInfo) {
+      await this.jobRepository.updateOne(
+        { _id: jobId },
+        { $set: { editorInfo: cancelJobDto.editorInfo } },
+      );
+    }
+
     const tasks = await this.taskRepository.find({
       _id: { $in: job.taskList },
       status: {
@@ -130,7 +157,7 @@ export class DispatchService {
       },
     });
 
-    await this.cancelTasks(tasks, cancelJobDto);
+    await this.cancelTasks(tasks, cancelJobDto, true);
 
     return job;
   }
@@ -172,9 +199,6 @@ export class DispatchService {
       tip: createDeliveryData.tip,
       externalStoreId: createDeliveryData.externalStoreId,
       pickupBusinessName: createDeliveryData.pickupBusinessName,
-      teamId: createDeliveryData.teamId,
-      tenantKey: createDeliveryData.tenantKey,
-      nashGroupId: createDeliveryData.nashGroupId,
       metadata: createDeliveryData.metadata,
     };
   }
@@ -218,7 +242,55 @@ export class DispatchService {
     await this.cancelTasks(pendingTasks);
   }
 
-  async cancelTasks(tasks: Task[], cancelJobDto?: CancelJobDto): Promise<void> {
+  async taskCancelledFromProvider(taskId: string) {
+    const task = await this.taskRepository.findOne(
+      {
+        taskId,
+        status: {
+          $nin: [
+            TaskStatusEnums.CANCELED,
+            TaskStatusEnums.CANCELED_FROM_PROVIDER,
+          ],
+        },
+      },
+      false,
+    );
+
+    if (!task) {
+      return;
+    }
+
+    this.logger.log(`Driver cancelled task: ${JSON.stringify(task)}`);
+
+    const job = await this.jobRepository.findOne(
+      {
+        taskList: task._id,
+      },
+      false,
+      { taskList: 1 },
+    );
+
+    const cancelTaskList = await this.taskRepository.find({
+      _id: { $in: job.taskList },
+    });
+
+    await this.cancelTasks(cancelTaskList, {
+      status: TaskStatusEnums.CANCELED_FROM_PROVIDER,
+    });
+
+    await this.createJob({
+      ...task.createdTaskData,
+      jobId: job?._id?.toString(),
+      quoteExternalReference: null,
+    });
+  }
+
+  async cancelTasks(
+    tasks: Task[],
+    cancelJobDto?: CancelJobDto,
+    throwError = false,
+  ): Promise<void> {
+    const cancellationErrors: string[] = [];
     for (const task of tasks) {
       try {
         await this.jobService.cancelProcess(task, {
@@ -230,12 +302,14 @@ export class DispatchService {
         });
       } catch (e) {
         e = e.response?.data || e;
-        this.logger.error(
-          `Failed to cancel task, providerService is ${task.providerService}, taskId: ${task.taskId}`,
-          '',
-          JSON.stringify(e),
-        );
+        const errorMessage = `Failed to cancel task, providerService is ${task.providerService}, taskId: ${task.taskId}`;
+        this.logger.error(errorMessage, '', JSON.stringify(e));
+        cancellationErrors.push(errorMessage);
       }
+    }
+
+    if (cancellationErrors.length && throwError) {
+      throw new BadRequestException(cancellationErrors);
     }
   }
 
@@ -250,6 +324,7 @@ export class DispatchService {
         {
           taskId: 1,
           providerService: 1,
+          taskDetails: 1,
         },
       );
 
@@ -258,25 +333,80 @@ export class DispatchService {
           task.providerService,
           task.taskId,
         );
-      if (details) {
-        task.taskDetails = details;
-      }
-      return await this.taskRepository.findOneAndUpdate(
-        { _id: task._id },
-        { $set: task },
-        {
-          new: true,
-          lean: true,
-          projection: {
-            taskId: 0,
-            quoteId: 0,
-            internalQuoteId: 0,
-            createdTaskData: 0,
-          },
-        },
-      );
+      await this.updateTaskDetails(task, details);
+
+      return await this.taskRepository.findOne({ _id: task._id }, true, {
+        taskId: 0,
+        quoteId: 0,
+        internalQuoteId: 0,
+        createdTaskData: 0,
+      });
     } catch (e) {
       throw new BadRequestException(e);
     }
+  }
+
+  async updateTaskDetails(
+    task: Task,
+    newTaskData: TaskStatusDto,
+  ): Promise<void> {
+    if (!task.taskDetails && !newTaskData.deliveryDetails) {
+      return;
+    }
+
+    task.taskDetails = {
+      refCode:
+        newTaskData.deliveryDetails?.refCode || task.taskDetails?.refCode,
+      status: newTaskData.deliveryDetails?.status || task.taskDetails?.status,
+      courier: {
+        name:
+          newTaskData.deliveryDetails?.courier?.name ||
+          task.taskDetails?.courier?.name,
+        vehicleType:
+          newTaskData.deliveryDetails?.courier?.vehicleType ||
+          task.taskDetails?.courier?.vehicleType,
+        phoneNumber:
+          newTaskData.deliveryDetails?.courier?.phoneNumber ||
+          task.taskDetails?.courier?.phoneNumber,
+        formattedPhoneNumber:
+          newTaskData.deliveryDetails?.courier?.formattedPhoneNumber ||
+          task.taskDetails?.courier?.formattedPhoneNumber,
+        locationHistory: task.taskDetails?.courier?.locationHistory
+          ? [
+              ...task.taskDetails?.courier?.locationHistory,
+              newTaskData.deliveryDetails?.courier?.location,
+            ]
+          : [newTaskData.deliveryDetails?.courier?.location],
+        imgHref:
+          newTaskData.deliveryDetails?.courier?.imgHref ||
+          task.taskDetails?.courier?.imgHref,
+        vehicleMake:
+          newTaskData.deliveryDetails?.courier?.vehicleMake ||
+          task.taskDetails?.courier?.vehicleMake,
+        vehicleModel:
+          newTaskData.deliveryDetails?.courier?.vehicleModel ||
+          task.taskDetails?.courier?.vehicleModel,
+        locationDescription:
+          newTaskData.deliveryDetails?.courier?.locationDescription ||
+          task.taskDetails?.courier?.locationDescription,
+        vehicleColor:
+          newTaskData.deliveryDetails?.courier?.vehicleColor ||
+          task.taskDetails?.courier?.vehicleColor,
+        trackingUrl:
+          newTaskData.deliveryDetails?.courier?.trackingUrl ||
+          task.taskDetails?.courier?.trackingUrl,
+      },
+      metadata: {
+        ...task.taskDetails?.metadata,
+        ...newTaskData.deliveryDetails?.metadata,
+      },
+    };
+
+    await this.taskRepository.updateOne(
+      { _id: task._id },
+      {
+        $set: task,
+      },
+    );
   }
 }
